@@ -1,1 +1,177 @@
-testing 
+import time
+import pandas as pd
+import yfinance as yf
+import streamlit as st
+
+st.set_page_config(page_title="Finviz-style Screener MVP", layout="wide")
+
+st.title("Finviz-style Screener MVP (Starter)")
+st.caption("This is a lightweight, buildable MVP: upload tickers, pull market data via yfinance, filter, sort, and inspect charts.")
+
+with st.sidebar:
+    st.header("1) Universe")
+    uploaded = st.file_uploader("Upload a CSV with a 'ticker' column (or one ticker per line)", type=["csv", "txt"])
+    default_list = "AAPL\nMSFT\nNVDA\nTSLA\nAMZN\nGOOGL\nMETA\nAMD\nPLTR\nSOFI"
+    raw_text = st.text_area("...or paste tickers here", value=default_list, height=150)
+    st.divider()
+
+    st.header("2) Filters")
+    price_min, price_max = st.slider("Price ($)", 0.0, 2000.0, (0.0, 2000.0), 1.0)
+    chg_min, chg_max = st.slider("Day % change", -50.0, 50.0, (-50.0, 50.0), 0.5)
+    vol_min = st.number_input("Min volume (shares)", min_value=0, value=0, step=100000)
+    mcap_min = st.number_input("Min market cap ($)", min_value=0.0, value=0.0, step=1e9, format="%.0f")
+    rsi_min, rsi_max = st.slider("RSI(14)", 0.0, 100.0, (0.0, 100.0), 1.0)
+
+    st.divider()
+    st.header("3) Table")
+    sort_col = st.selectbox("Sort by", ["ticker", "price", "change_pct", "volume", "market_cap", "rsi14"], index=1)
+    sort_desc = st.checkbox("Sort descending", value=True)
+    refresh = st.button("Refresh data")
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_data(tickers: list[str]) -> pd.DataFrame:
+    # yf.download is faster than per-ticker calls; we use group_by='ticker' style with multi-index columns.
+    if not tickers:
+        return pd.DataFrame()
+    data = yf.download(
+        tickers=tickers,
+        period="5d",
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        threads=True,
+        progress=False,
+    )
+    rows = []
+    for t in tickers:
+        try:
+            # Handle single vs multi ticker output
+            if isinstance(data.columns, pd.MultiIndex):
+                df = data[t].dropna()
+            else:
+                df = data.dropna()
+
+            if df.empty:
+                continue
+
+            last = df.iloc[-1]
+            prev = df.iloc[-2] if len(df) >= 2 else last
+            price = float(last["Close"])
+            change_pct = (float(last["Close"]) / float(prev["Close"]) - 1.0) * 100.0
+            volume = int(last.get("Volume", 0))
+
+            info = {}
+            try:
+                info = yf.Ticker(t).fast_info or {}
+            except Exception:
+                info = {}
+
+            mcap = float(info.get("marketCap") or 0)
+
+            rows.append({
+                "ticker": t,
+                "price": price,
+                "change_pct": change_pct,
+                "volume": volume,
+                "market_cap": mcap,
+            })
+        except Exception:
+            continue
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    # RSI(14) computed from 30d daily closes for better stability
+    rsi_vals = {}
+    for t in out["ticker"].tolist():
+        try:
+            hist = yf.download(t, period="3mo", interval="1d", progress=False)
+            close = hist["Close"].dropna()
+            if len(close) < 15:
+                rsi_vals[t] = None
+                continue
+            delta = close.diff()
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss = (-delta.clip(upper=0)).rolling(14).mean()
+            rs = gain / loss.replace(0, pd.NA)
+            rsi = 100 - (100 / (1 + rs))
+            rsi_vals[t] = float(rsi.iloc[-1])
+        except Exception:
+            rsi_vals[t] = None
+
+    out["rsi14"] = out["ticker"].map(rsi_vals)
+    return out
+
+def parse_universe(uploaded, raw_text: str) -> list[str]:
+    tickers = []
+    if uploaded is not None:
+        if uploaded.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded)
+            if "ticker" in df.columns:
+                tickers = df["ticker"].astype(str).tolist()
+            else:
+                # assume first column
+                tickers = df.iloc[:, 0].astype(str).tolist()
+        else:
+            tickers = uploaded.read().decode("utf-8", errors="ignore").splitlines()
+    else:
+        tickers = raw_text.splitlines()
+
+    tickers = [t.strip().upper() for t in tickers if t and t.strip()]
+    # de-dup preserve order
+    seen = set()
+    clean = []
+    for t in tickers:
+        if t not in seen:
+            clean.append(t)
+            seen.add(t)
+    return clean
+
+tickers = parse_universe(uploaded, raw_text)
+
+if refresh:
+    st.cache_data.clear()
+
+df = fetch_data(tickers)
+
+if df.empty:
+    st.warning("No data yet. Try fewer tickers or verify symbols.")
+    st.stop()
+
+# Apply filters
+filtered = df[
+    (df["price"].between(price_min, price_max)) &
+    (df["change_pct"].between(chg_min, chg_max)) &
+    (df["volume"] >= vol_min) &
+    (df["market_cap"] >= mcap_min) &
+    (df["rsi14"].fillna(-1).between(rsi_min, rsi_max))
+].copy()
+
+filtered = filtered.sort_values(sort_col, ascending=not sort_desc)
+
+col1, col2 = st.columns([2, 1], gap="large")
+
+with col1:
+    st.subheader("Results")
+    st.dataframe(
+        filtered,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "price": st.column_config.NumberColumn(format="%.2f"),
+            "change_pct": st.column_config.NumberColumn(format="%.2f"),
+            "market_cap": st.column_config.NumberColumn(format="%.0f"),
+            "rsi14": st.column_config.NumberColumn(format="%.1f"),
+        },
+    )
+
+with col2:
+    st.subheader("Inspect")
+    pick = st.selectbox("Select a ticker", filtered["ticker"].tolist() if len(filtered) else df["ticker"].tolist())
+    if pick:
+        hist = yf.download(pick, period="6mo", interval="1d", progress=False)
+        st.line_chart(hist["Close"].dropna(), height=220)
+        st.bar_chart(hist["Volume"].dropna(), height=180)
+
+st.caption("MVP note: yfinance is convenient but not a guaranteed SLA feed. For production, replace with Polygon/IEX/Alpaca and cache results server-side.") 
